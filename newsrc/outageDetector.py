@@ -3,6 +3,8 @@ import pandas as pd
 from common.fetcher import ChocFetcher
 import multiprocessing, queue, signal, time
 import zmq
+import sys
+from common.arimapredictor import ArimaPredictor
 
 def parseTskBatch(content):
     if content[0:9] != b'TSKBATCH\x00':
@@ -40,31 +42,43 @@ class RealTimeSeries(object):
     def __init__(self, keystr, workerid):
         self.workerid = workerid
         self.keystr = keystr
-        self.history = {}
-        self.hist_timestamps = []
+        self.history = None
+        self.stepsperhour = 12
 
+        self.is_zeromodel = False
         self.arma = None
         self.arma_source=""
         self.last_arma_check = 0
         self.arma_requested = False
-
-        self.fetchedhistory = False
 
         if keystr.split('.')[0] == "darknet":
             self.datafreq = 60
         else:
             self.datafreq = 300
 
-        self.predictstart = 0
-        self.predictions = []
-
         self.zmq_out = None
+        self.lasteval = 0
+        self.model = None
 
     def addQueue(self, zmqout):
         self.zmq_out = zmqout
 
     def getWorkerId(self):
         return self.workerid
+
+    def evaluateLiveDataArima(self, duration):
+        endts = self.history.index[-1]
+        pred_startts = endts - pd.DateOffset(minutes=duration)
+
+        steps = int(duration  / (60 / self.stepsperhour))
+
+        if self.model is None:
+            self.model = ArimaPredictor(self.arma, self.datafreq)
+
+        df, diff_df = self.model.prepare_histories(self.history,
+                self.history.index[0], pred_startts)
+
+        self.lasteval = endts
 
     def checkArmaModel(self, timestamp):
         # TODO if we have a model already, consider whether we should
@@ -75,7 +89,7 @@ class RealTimeSeries(object):
 
         # query model DB for a known best model for this series
         now = time.time()
-        if now - self.last_arma_check >= 15 * 60 * 60:
+        if now - self.last_arma_check >= 5 * 60:
             self.last_arma_check = int(now)
 
             # TODO query the database for our model
@@ -89,6 +103,7 @@ class RealTimeSeries(object):
         if self.arma_requested == False:
             self.requestModel(self.keystr, timestamp)
             self.arma_requested = True
+            self.last_arma_check = int(now)
 
         # then pick the default model for this series type
         self.arma = getDefaultModel(self.keystr.split('.'))
@@ -101,21 +116,19 @@ class RealTimeSeries(object):
 
         if seriestype == "darknet":
             fetched = fetcher.fetchTelescopeData(self.keystr,
-                firstlive, 4 * 7 * 24 * 60 * 60)
+                firstlive, 10 * 7 * 24 * 60 * 60)
+            self.stepsperhour = 60
 
         if fetched is None:
             return None
 
-        for f in fetched:
-            dts = f['timestamp'].timestamp()
-            self.history[dts] = f['signalValue']
-            self.hist_timestamps.append(dts)
+        self.history = pd.DataFrame(fetched)
+        self.history.set_index('timestamp', inplace=True)
 
-        self.hist_timestamps.sort()
-        self.fetchedhistory = True
         return True
 
     def requestModel(self, serieskey, timestamp):
+        print("attempting to request model for", serieskey)
         self.zmq_out.send_json({"serieskey": serieskey, "ts": timestamp})
 
 
@@ -139,7 +152,11 @@ class ChocRTWorker(object):
         s.addQueue(self.zmq_out)
         s.checkArmaModel(timestamp)
         s.fetchHistory(self.fetcher, timestamp)
-        print(s.workerid, s.keystr, s.hist_timestamps[0], s.hist_timestamps[-1])
+
+        if s.is_zeromodel:
+            pass
+        elif s.arma_source != "":
+            s.evaluateLiveDataArima(30)
 
         # TODO make predictions up until the end of the hour
 
@@ -204,9 +221,8 @@ class ChocRTPool(object):
         self.zmqsock = self.zmq.socket(zmq.PUSH)
         self.zmqsock.bind(zmqpushaddr)
         self.zmq_internal = zmqinternal
+        self.zmq_in = None
 
-        self.zmq_in = self.zmq.socket(zmq.PULL)
-        self.zmq_in.bind(zmqinternal)
 
     def startWorkers(self):
         if self.numworkers <= 0:
@@ -249,11 +265,17 @@ class ChocRTPool(object):
             self.nextassign = self.nextassign % self.numworkers
 
     def pollModelRequests(self):
+        if self.zmq_in is None:
+            self.zmq_in = self.zmq.socket(zmq.PULL)
+            self.zmq_in.bind(self.zmq_internal)
 
         while True:
             try:
                 req = self.zmq_in.recv_json(flags=zmq.NOBLOCK)
-            except zmq.ZMQError:
+            except zmq.Again:
+                break
+            except zmq.ZMQError as e:
+                print(e)
                 break
 
             print("Requesting model build for %s" % (req))
@@ -276,7 +298,8 @@ if __name__ == "__main__":
     MAXWORKERS = 8
     IODAAPI="https://api.ioda.caida.org/dev/signals/raw"
     ZMQADDR="tcp://127.0.0.1:44332"
-    ZMQINTERNAL="tcp://127.0.0.1:19999"
+    #ZMQINTERNAL="tcp://127.0.0.1:19999"
+    ZMQINTERNAL="ipc:///tmp/zmqtesting"
 
     workers = ChocRTPool(MAXWORKERS, IODAAPI, ZMQADDR, ZMQINTERNAL)
 
@@ -294,7 +317,6 @@ if __name__ == "__main__":
             if keystr not in workers.knownSeries:
                 workers.addSeriesToWorker(keystr, ts)
 
-            print(ts, keystr, value)
             workers.updateSeriesLive(keystr, value, ts)
             kc.commit()
         except KeyboardInterrupt:
